@@ -1,0 +1,26 @@
+[package]
+name = "overclock"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "5"
+overclock_core = { path = "../core" }
+
+[dev-dependencies]
+# host-side tests only; never part of the wasm build
+near-sdk = { version = "5", features = ["unit-testing"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+panic = "abort"
+overflow-checks = true
+
+[workspace]
+
