@@ -1,0 +1,22 @@
+# Secrets — never commit keys, seeds or environment files
+.env
+.env.*
+*.pem
+*.key
+keys-to-vps/
+**/.near-credentials/
+near-keys/
+credentials*
+secrets*
+
+# Build artifacts
+node_modules/
+target/
+dist/
+.vite/
+*.wasm
+
+# Misc
+*.log
+.DS_Store
+scratch/
