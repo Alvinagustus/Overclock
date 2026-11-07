@@ -98,8 +98,8 @@ const view = async (m, a = {}) => {
     try {
       return await account.viewFunction({ contractId: CONTRACT, methodName: m, args: a });
     } catch (e) {
-      if (i >= 5 || !retryable(e)) throw e;
-      await sleep(1000 * 2 ** i); // 429 / transient HTTP
+      if (i >= 3 || !retryable(e)) throw e;
+      await sleep(1500 * 2 ** i); // 429 / transient HTTP — cap at ~15s total so the outer loop keeps streaming
     }
   }
 };
@@ -119,98 +119,158 @@ const callTolerant = async (method, args, deposit = "0", gas = 50_000_000_000_00
     }
   }
 };
+// ---------------------------------------------------------------------------
+// Persistent duel loop — replaces the old single-duel run:
+//   scan → recover/play active duel → (re)queue → repeat forever.
+// A crash mid-duel no longer strands the duel: on restart we play or settle
+// the active duel BEFORE doing any queue bookkeeping.
+// ---------------------------------------------------------------------------
+const STATE_FILE = path.join(path.dirname(path.resolve(".")), `.overclock-npc-state-${NPC_ACCOUNT}.json`);
+const ROUNDS = process.env.NPC_ROUNDS ? Number(process.env.NPC_ROUNDS) : Infinity;
 
-console.log(`[npc:${persona}] ${NPC_ACCOUNT} joining tier ${tier} (casual)…`);
-const existing = await view("get_player", { account: NPC_ACCOUNT }).catch(() => null);
-if (existing) {
-  console.log(`[npc:${persona}] already registered`);
-} else {
-  try { await callTolerant("register_agent", {}, STORAGE_DEPOSIT); console.log(`[npc:${persona}] registered`); } catch { /* already registered */ }
-}
-// Clean up any stale queue entry from a previous crashed session before
-// joining — the contract asserts (traps) if we join while already queued.
-if (existing?.queued) {
-  try { await callTolerant("cancel_queue", { tier, casual: true }); console.log(`[npc:${persona}] cleared stale queue`); } catch { /* not queued in this tier/mode */ }
-}
-try {
-  await callTolerant("join_queue", { tier, casual: true }, tierStake);
-} catch (e) {
-  const p = await view("get_player", { account: NPC_ACCOUNT }).catch(() => null);
-  if (!p?.queued) throw e;
-  console.log(`[npc:${persona}] already queued from an earlier session — adopting it`);
-}
-console.log(`[npc:${persona}] queued — polling for a match…`);
+let duelState = {};
+try { duelState = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { /* fresh */ }
+const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify(duelState)); } catch { /* best effort */ } };
 
-let duelId = null;
-let lastSeq = -1; // only scan duels when duel_seq moves — saves ~10x RPC calls
-for (let i = 0; i < 60 && !duelId; i++) {
-  await new Promise((r) => setTimeout(r, 2000));
+let lastSeenSeq = -1; // enumerate duels only when duel_seq moves — 1 RPC per idle cycle
+const scanMyDuels = async () => {
   const cfg = await view("get_config");
   const seq = Number(cfg.duel_seq);
-  if (seq === lastSeq) continue;
-  lastSeq = seq;
-  // Scan backwards across recent duels: our duel may be older than the latest one
-  // if another duel started after we queued. Skip settled duels so a stale
-  // duel from an earlier session is never picked.
+  if (seq === lastSeenSeq) return [];
+  lastSeenSeq = seq;
+  const mine = [];
   for (let id = seq; id > 0 && id > seq - 20; id--) {
     try {
       const d = await view("get_duel", { duel_id: id });
-      if (d && (d.a === NPC_ACCOUNT || d.b === NPC_ACCOUNT) && !d.settled) { duelId = id; break; }
-    } catch { /* duel_id 0 or pruned */ }
+      if (d && (d.a === NPC_ACCOUNT || d.b === NPC_ACCOUNT)) mine.push(d);
+    } catch { /* pruned */ }
   }
-}
-if (!duelId) throw new Error("no duel (queue empty — start a human casual join first)");
+  return mine;
+};
 
-const problem = await view("get_problem", { duel_id: duelId });
-const localAnswer = solveText(problem.text);
-let answer = localAnswer;
-try {
-  const ai = await askModel(problem.text);
-  if (ai !== null) {
-    console.log(`[npc:${persona}] model answered ${ai} (local computed ${localAnswer}, expected contract check applies)`);
-    answer = ai;
+const playDuel = async (first) => {
+  const id = Number(first.id);
+  const isA = first.a === NPC_ACCOUNT;
+  const committedAt = isA !== false ? {} : {};
+  let d = await view("get_duel", { duel_id: id });
+  const committedBefore = !!(isA ? d.hash_a : d.hash_b);
+  const revealedBefore = isA ? d.revealed_a : d.revealed_b;
+  console.log(`[npc:${persona}] duel #${id} vs ${isA ? d.b : d.a} — committed=${committedBefore} revealed_a=${d.revealed_a} revealed_b=${d.revealed_b}`);
+
+  // Solve once and persist the exact answer: commit and reveal must match even
+  // across watchdog restarts (a fresh AI answer could otherwise break reveal).
+  let answer = duelState[id]?.answer ?? null;
+  if (answer !== null) {
+    console.log(`[npc:${persona}] duel #${id}: using persisted answer ${answer}`);
+  } else {
+    const problem = await view("get_problem", { duel_id: id });
+    answer = solveText(problem.text);
+    try {
+      const ai = await askModel(problem.text);
+      if (ai !== null) {
+        console.log(`[npc:${persona}] model answered ${ai} (local ${answer})`);
+        answer = ai;
+      }
+    } catch (e) {
+      console.log(`[npc:${persona}] model failed (${e.message}) — answering locally: ${answer}`);
+    }
+    duelState[id] = { answer: String(answer) };
+    saveState();
   }
-} catch (e) {
-  console.log(`[npc:${persona}] model failed (${e.message}) — answering locally: ${localAnswer}`);
-}
 
-if (!Number.isFinite(answer)) throw new Error("cannot solve problem locally");
+  let committedHere = false;
 
-const salt = `salt-${duelId}-${NPC_ACCOUNT}`;
-const commitHash = sha256hex(`${duelId}:${NPC_ACCOUNT}:${answer}:${salt}`);
-console.log(`[npc:${persona}] duel #${duelId}: ${problem.text} committing ${answer}`);
-await call("submit_answer", { duel_id: duelId, answer_hash: commitHash });
-console.log(`[npc:${persona}] committed`);
+  // 1) Commit while the window is open and we have not committed yet.
+  if (!d.settled && !committedBefore && Date.now() < Number(d.deadline)) {
+    const salt = `salt-${id}-${NPC_ACCOUNT}`;
+    const commitHash = sha256hex(`${id}:${NPC_ACCOUNT}:${answer}:${salt}`);
+    console.log(`[npc:${persona}] duel #${id}: committing ${answer}…`);
+    try {
+      await callTolerant("submit_answer", { duel_id: id, answer_hash: commitHash });
+      console.log(`[npc:${persona}] duel #${id}: committed`);
+      committedHere = true;
+    } catch (e) {
+      // Window may have closed between the check and our tx landing — settle path below handles it.
+      console.log(`[npc:${persona}] duel #${id}: commit rejected — ${String(e?.message ?? e).slice(0, 120)}`);
+    }
+  }
 
-// Reveal is only allowed once both sides have committed, or after the
-// commit window closes (guard H-01). Wait for that; revealing earlier
-// fails on-chain and would expose the answer while the opponent is open.
-for (let i = 0; i < 40; i++) {
-  const d = await view("get_duel", { duel_id: duelId });
-  const both = !!(d.hash_a && d.hash_b);
-  const pastDeadline = Date.now() > Number(d.deadline);
-  if (both || pastDeadline) break;
-  await new Promise((r) => setTimeout(r, 1000));
-}
-await call("reveal", { duel_id: duelId, answer, salt });
-console.log(`[npc:${persona}] revealed`);
+  // 2) Reveal once the contract allows it (both committed, or deadline passed).
+  let revealAnswerable = committedHere || duelState[id]?.answer === String(answer);
+  let revealed = revealedBefore;
+  while (!revealed && Date.now() < Number(d.reveal_deadline) && revealAnswerable) {
+    d = await view("get_duel", { duel_id: id });
+    if (d.settled) break;
+    revealed = isA ? d.revealed_a : d.revealed_b;
+    if (revealed) break;
+    const both = !!(d.hash_a && d.hash_b);
+    const commitWindowOver = Date.now() > Number(d.deadline);
+    if (!both && !commitWindowOver) {
+      await sleep(1500);
+      continue;
+    }
+    try {
+      await callTolerant("reveal", { duel_id: id, answer: String(answer), salt: `salt-${id}-${NPC_ACCOUNT}` });
+      console.log(`[npc:${persona}] duel #${id}: revealed`);
+      revealed = true;
+    } catch (e) {
+      console.log(`[npc:${persona}] duel #${id}: reveal pending — ${String(e?.message ?? e).slice(0, 120)}`);
+      await sleep(3000);
+    }
+  }
+  if (!revealed && !d.settled) {
+    console.log(`[npc:${persona}] duel #${id}: not revealing (committed=${committedBefore}/${revealAnswerable}) — settling once the window closes`);
+  }
 
-// Settle is allowed once every committed side has revealed (early settle),
-// otherwise after the reveal window. Poll instead of a single blind wait so
-// an opponent who already settled is not retried, and a slow window is
-// retried rather than forgotten.
-let settled = false;
-for (let i = 0; i < 15 && !settled; i++) {
+  // 3) Settle as soon as the contract allows; keep trying within the window.
+  for (let i = 0; i < 30; i++) {
+    try {
+      d = await view("get_duel", { duel_id: id });
+      if (d.settled) {
+        console.log(`[npc:${persona}] duel #${id} settled: winner=${d.winner} draw=${d.draw}`);
+        return;
+      }
+      await callTolerant("settle", { duel_id: id }, "0", 200_000_000_000_000n);
+      const after = await view("get_duel", { duel_id: id });
+      console.log(`[npc:${persona}] duel #${id} settled: winner=${after.winner} draw=${after.draw}`);
+      return;
+    } catch (e) {
+      await sleep(4000);
+    }
+  }
+  console.log(`[npc:${persona}] duel #${id}: settle window not ready — will retry on next loop`);
+};
+
+let rounds = 0;
+console.log(`[npc:${persona}] persistent duel loop starting (tier ${tier})`);
+while (rounds < ROUNDS) {
   try {
-    const d = await view("get_duel", { duel_id: duelId });
-    if (d.settled) { console.log(`[npc:${persona}] duel #${duelId} settled: winner=${d.winner} draw=${d.draw}`); settled = true; break; }
-    await call("settle", { duel_id: duelId }, "0", 200_000_000_000_000n);
-    const after = await view("get_duel", { duel_id: duelId });
-    console.log(`[npc:${persona}] duel #${duelId} settled: winner=${after.winner} draw=${after.draw}`);
-    settled = true;
+    const mine = await scanMyDuels();
+    const active = mine.filter((x) => !x.settled);
+    if (active.length) {
+      // In-flight duel takes priority over any queue bookkeeping — commit
+      // windows are short and every repeat cycle is a lost duel.
+      await playDuel(active[active.length - 1]);
+      continue;
+    }
+    // No active duel. Make sure we are queued (idempotently, minimal txs).
+    const p = await view("get_player", { account: NPC_ACCOUNT }).catch(() => null);
+    if (!p) throw new Error("player not registered yet");
+    if (p.queued) {
+      if (rounds % 24 === 0) console.log(`[npc:${persona}] queued — waiting for a match…`);
+    } else {
+      try {
+        await callTolerant("join_queue", { tier, casual: true }, tierStake);
+        console.log(`[npc:${persona}] joined tier ${tier} (casual)`);
+      } catch (e) {
+        const p2 = await view("get_player", { account: NPC_ACCOUNT }).catch(() => null);
+        if (!p2?.queued) throw e;
+        console.log(`[npc:${persona}] already queued — adopting it`);
+      }
+    }
   } catch (e) {
-    if (i === 14) console.log(`[npc:${persona}] settle not ready (${e.message.slice(0,150)}) — anyone can settle after the window`);
-    else await new Promise((r) => setTimeout(r, 2000));
+    console.log(`[npc:${persona}] cycle error: ${String(e?.message ?? e).slice(0, 200)}`);
   }
+  rounds++;
+  await sleep(5000);
 }
-
