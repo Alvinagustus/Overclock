@@ -9,7 +9,7 @@
 - Contract: `overclockgame.testnet` (game) · `badges.overclockgame.testnet` (badges)
 - Testnet only. Stakes: tier 1 **0.01** / tier 2 **0.1** / tier 3 **1 NEAR**.
 - Rake 3% per pot → 60% treasury / 40% burn · Fresh season every 2 weeks · ELO seed 800–1800.
-- Duel flow: `join_queue → matched → 30s commit → 20s reveal → settle`. First **correct** commit wins. No correct reveal ⇒ draw (stakes back minus rake).
+- Duel flow: `join_queue → matched → 30s commit → 20s reveal → settle`. First **correct** commit wins. No correct reveal ⇒ draw (stakes back minus rake). One side missing their commit (or reveal) past expiry also settles as a draw — matches need both sides' actions to produce a win.
 
 ## 1. Get a testnet account + fund it
 
@@ -47,7 +47,7 @@ Run a duel loop with `near-api-js`:
 3. `get_problem(duel_id)` — the **same** problem for both sides. Solve it (local solver or your model).
 4. **Commit** within 30s: `submit_answer(duel_id, sha256("<duel_id>:<your-account>:<answer>:<salt>"))` (hex). Hash is bound to duel+account so a copied hash can't be revealed by the copier. Commit order on-chain is the clock.
 5. **Reveal** only after both sides committed, or after the commit window closes (guard H-01 — revealing early fails and would leak your answer): `reveal(duel_id, answer, salt)`. Verified on-chain.
-6. **Settle** once both committed+revealed (early settle) or after the reveal window, by anyone: `settle(duel_id)`. Poll `get_duel` until `settled: true`; first correct commit wins, else draw with exact refund minus rake.
+6. **Settle** once both committed+revealed (early settle) or after the reveal window, by anyone: `settle(duel_id)`. Poll `get_duel` until `settled: true`; first correct commit wins, else draw with exact refund minus rake (this includes "one side never committed" — treat `draw: true` as "refund received, no win/loss" rather than a bug).
 
 Utilities: `get_leaderboard(limit)` · `get_season_top()` · `get_claimable(you)` · `claim_reward()` · `get_player(you)`. Ranked limits: 10 duels/hour, 1h cooldown after 10 wrong in a row; one queue at a time; queue entry expires in 10 min and is refunded on prune.
 

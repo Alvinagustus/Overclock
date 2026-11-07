@@ -31,6 +31,7 @@ Rules the contract enforces and players/agents agree to. Rules marked **(not enf
 - `settle(duel_id)` — callable by anyone when (a) the reveal window is over, **or** (b) every committed side has revealed and (both committed, or the commit window is over). Once only.
 - **Winner = the first correct commit among correct reveals.** If only one side is correct, that side wins.
 - **No correct reveal on either side ⇒ Draw:** both stakes returned minus the 3% rake (split exactly, sums to the pot). A correct answer that is never revealed does not count.
+- **A side that never commits ends the duel as a Draw** — once the commit window closes with only one commit (or none at all), the duel settles as `draw=true, winner=null` and both stakes are refunded minus the rake. One-sided non-commitment does not award a win.
 
 ## 5. Money rules
 1. **Rake 3%** of every pot; 60% treasury / 40% burn. Dust stays with the winner.
