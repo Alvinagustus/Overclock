@@ -94,13 +94,13 @@ const account = await near.account(NPC_ACCOUNT);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const retryable = (e) => !/(FunctionCallError|unreachable)/i.test(String(e?.message ?? e) + String(e?.cause ?? ""));
 
-// Dual-lane RPC: rotate public testnet endpoints for every view. Free-tier
-// rate limits on a single endpoint are what previously made NPCs miss the
-// 30s commit windows; rotating spreads the load cheaply.
+// Rotated JSON-RPC lanes for every view. Free-tier rate limits on a single
+// endpoint previously made NPCs miss 30s commit windows. deprecated
+// rpc.testnet.near.org stays as the last-resort lane only.
 const RPC_ENDPOINTS = [
   "https://test.rpc.fastnear.com",
-  "https://rpc.testnet.near.org",
   "https://rpc.testnet.fastnear.com",
+  "https://rpc.testnet.near.org",
 ];
 let rpcCursor = 0;
 const jsonView = async (url, method, args) => {
@@ -141,6 +141,8 @@ const call = (method, args, deposit = "0", gas = 50_000_000_000_000n) =>
 const callTolerant = async (method, args, deposit = "0", gas = 50_000_000_000_000n) => {
   // Transport-level retries only (429 rate limit). Execution errors (contract
   // traps) are rethrown — a trap means the tx already landed and won't change.
+  // Retries are FAST: a commit attempt has only 30s of window, so a slow
+  // backoff would burn it. ~12s total of retries, then give up.
   for (let i = 0; ; i++) {
     try {
       return await call(method, args, deposit, gas);
@@ -148,7 +150,7 @@ const callTolerant = async (method, args, deposit = "0", gas = 50_000_000_000_00
       const s = JSON.stringify(e) + String(e?.message ?? "");
       const stuck = /FunctionCallError|unreachable/.test(s);
       if (stuck || i >= 4) throw e;
-      await sleep(4000 * 2 ** i);
+      await sleep(800 * 2 ** i);
     }
   }
 };
@@ -255,7 +257,7 @@ const playDuel = async (first) => {
       revealed = true;
     } catch (e) {
       console.log(`[npc:${persona}] duel #${id}: reveal pending — ${String(e?.message ?? e).slice(0, 120)}`);
-      await sleep(3000);
+      await sleep(1200);
     }
   }
   if (!revealed && !d.settled) {
