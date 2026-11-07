@@ -90,20 +90,65 @@ const keyStore = new keyStores.InMemoryKeyStore();
 await keyStore.setKey("testnet", NPC_ACCOUNT, KeyPair.fromString(NPC_KEY));
 const near = await connect({ networkId: "testnet", keyStore, nodeUrl: "https://test.rpc.fastnear.com" });
 const account = await near.account(NPC_ACCOUNT);
-const view = (m, a = {}) => account.viewFunction({ contractId: CONTRACT, methodName: m, args: a });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const retryable = (e) => !/(FunctionCallError|unreachable)/i.test(String(e?.message ?? e) + String(e?.cause ?? ""));
+const view = async (m, a = {}) => {
+  for (let i = 0; ; i++) {
+    try {
+      return await account.viewFunction({ contractId: CONTRACT, methodName: m, args: a });
+    } catch (e) {
+      if (i >= 5 || !retryable(e)) throw e;
+      await sleep(1000 * 2 ** i); // 429 / transient HTTP
+    }
+  }
+};
 const call = (method, args, deposit = "0", gas = 50_000_000_000_000n) =>
   account.functionCall({ contractId: CONTRACT, methodName: method, args, gas, attachedDeposit: BigInt(deposit) });
+const callTolerant = async (method, args, deposit = "0", gas = 50_000_000_000_000n) => {
+  // Transport-level retries only (429 rate limit). Execution errors (contract
+  // traps) are rethrown — a trap means the tx already landed and won't change.
+  for (let i = 0; ; i++) {
+    try {
+      return await call(method, args, deposit, gas);
+    } catch (e) {
+      const s = JSON.stringify(e) + String(e?.message ?? "");
+      const stuck = /FunctionCallError|unreachable/.test(s);
+      if (stuck || i >= 4) throw e;
+      await sleep(4000 * 2 ** i);
+    }
+  }
+};
 
 console.log(`[npc:${persona}] ${NPC_ACCOUNT} joining tier ${tier} (casual)…`);
-try { await call("register_agent", {}, STORAGE_DEPOSIT); console.log(`[npc:${persona}] registered`); } catch { /* already registered */ }
-await call("join_queue", { tier, casual: true }, tierStake);
+const existing = await view("get_player", { account: NPC_ACCOUNT }).catch(() => null);
+if (existing) {
+  console.log(`[npc:${persona}] already registered`);
+} else {
+  try { await callTolerant("register_agent", {}, STORAGE_DEPOSIT); console.log(`[npc:${persona}] registered`); } catch { /* already registered */ }
+}
+// Clean up any stale queue entry from a previous crashed session before
+// joining — the contract asserts (traps) if we join while already queued.
+if (existing?.queued) {
+  try { await callTolerant("cancel_queue", { tier, casual: true }); console.log(`[npc:${persona}] cleared stale queue`); } catch { /* not queued in this tier/mode */ }
+}
+try {
+  await callTolerant("join_queue", { tier, casual: true }, tierStake);
+} catch (e) {
+  const p = await view("get_player", { account: NPC_ACCOUNT }).catch(() => null);
+  if (!p?.queued) throw e;
+  console.log(`[npc:${persona}] already queued from an earlier session — adopting it`);
+}
 console.log(`[npc:${persona}] queued — polling for a match…`);
 
 let duelId = null;
+let lastSeq = -1; // only scan duels when duel_seq moves — saves ~10x RPC calls
 for (let i = 0; i < 60 && !duelId; i++) {
   await new Promise((r) => setTimeout(r, 2000));
   const cfg = await view("get_config");
   const seq = Number(cfg.duel_seq);
+  if (seq === lastSeq) continue;
+  lastSeq = seq;
   // Scan backwards across recent duels: our duel may be older than the latest one
   // if another duel started after we queued. Skip settled duels so a stale
   // duel from an earlier session is never picked.
