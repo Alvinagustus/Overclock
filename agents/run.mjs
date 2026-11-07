@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { connect, keyStores, KeyPair } from "near-api-js";
+import { connect, keyStores, KeyPair, providers } from "near-api-js";
 
 const persona = process.argv.includes("--persona")
   ? process.argv[process.argv.indexOf("--persona") + 1]
@@ -93,13 +93,46 @@ const account = await near.account(NPC_ACCOUNT);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const retryable = (e) => !/(FunctionCallError|unreachable)/i.test(String(e?.message ?? e) + String(e?.cause ?? ""));
+
+// Dual-lane RPC: rotate public testnet endpoints for every view. Free-tier
+// rate limits on a single endpoint are what previously made NPCs miss the
+// 30s commit windows; rotating spreads the load cheaply.
+const RPC_ENDPOINTS = [
+  "https://test.rpc.fastnear.com",
+  "https://rpc.testnet.near.org",
+  "https://rpc.testnet.fastnear.com",
+];
+let rpcCursor = 0;
+const jsonView = async (url, method, args) => {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "query",
+      params: {
+        request_type: "call_function",
+        account_id: CONTRACT,
+        method_name: method,
+        args_base64: Buffer.from(JSON.stringify(args)).toString("base64"),
+        finality: "optimistic",
+      },
+    }),
+  });
+  const body = await res.json();
+  if (body.error) throw new Error(`rpc ${url}: ${JSON.stringify(body.error).slice(0, 160)}`);
+  return JSON.parse(Buffer.from(body.result.result).toString()) ?? null;
+};
 const view = async (m, a = {}) => {
-  for (let i = 0; ; i++) {
+  for (let attempt = 0; ; attempt++) {
+    const url = RPC_ENDPOINTS[(rpcCursor++) % RPC_ENDPOINTS.length];
     try {
-      return await account.viewFunction({ contractId: CONTRACT, methodName: m, args: a });
+      return await jsonView(url, m, a);
     } catch (e) {
-      if (i >= 3 || !retryable(e)) throw e;
-      await sleep(1500 * 2 ** i); // 429 / transient HTTP — cap at ~15s total so the outer loop keeps streaming
+      if (attempt >= 4) throw e;
+      if (retryable(e)) await sleep(300 * 2 ** attempt);
+      else throw e;
     }
   }
 };
@@ -139,7 +172,9 @@ const scanMyDuels = async () => {
   if (seq === lastSeenSeq) return [];
   lastSeenSeq = seq;
   const mine = [];
-  for (let id = seq; id > 0 && id > seq - 20; id--) {
+  // Our active duel is almost always among the newest few — newer duels are
+  // only created after ours settled. 5 duels keep scans cheap (no 429 storms).
+  for (let id = seq; id > 0 && id > seq - 5; id--) {
     try {
       const d = await view("get_duel", { duel_id: id });
       if (d && (d.a === NPC_ACCOUNT || d.b === NPC_ACCOUNT)) mine.push(d);
@@ -193,6 +228,11 @@ const playDuel = async (first) => {
       // Window may have closed between the check and our tx landing — settle path below handles it.
       console.log(`[npc:${persona}] duel #${id}: commit rejected — ${String(e?.message ?? e).slice(0, 120)}`);
     }
+  } else if (committedBefore) {
+    console.log(`[npc:${persona}] duel #${id}: already committed from an earlier session`);
+  } else if (!d.settled) {
+    const lateSec = Math.round((Date.now() - Number(d.deadline)) / 1000);
+    console.log(`[npc:${persona}] duel #${id}: discovered ${lateSec}s too late for commit — settling`);
   }
 
   // 2) Reveal once the contract allows it (both committed, or deadline passed).
@@ -272,5 +312,5 @@ while (rounds < ROUNDS) {
     console.log(`[npc:${persona}] cycle error: ${String(e?.message ?? e).slice(0, 200)}`);
   }
   rounds++;
-  await sleep(5000);
+  await sleep(2000); // 2s cadence — a human join creates a duel instantly and the commit window is only 30s
 }
