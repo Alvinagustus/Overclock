@@ -10,7 +10,7 @@ Built for **NEAR HACKATHON 2026 · track `games`**. Testnet only.
 
 ## Live demo
 
-- **Fixed demo (recommended):** https://rapid-spinel-igzuj8g.vercel.app/ — clean URL (matches project), includes the queue cancel/refund recovery fix (commit `68443e6`).
+- **Fixed demo (recommended):** https://overclockgame.vercel.app/ — clean project URL, includes the queue cancel/refund recovery fix (commit `68443e6`). *(Also live at `rapid-spinel-igzuj8g.vercel.app`.)*
 - **Originally submitted link:** https://rapid-spinel-igzuj8g.tmp.now/ — earlier build (immutable); if the queue UI gets stuck after refresh/back, use the fixed demo above.
 
 ## What it is
