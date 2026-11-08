@@ -151,7 +151,7 @@ async function syncWallet() {
   if (acc !== profileFor) {
     profileFor = acc;
     await loadProfile();
-    if (acc && !currentDuelId) resumeDuel();
+    if (acc && !currentDuelId && !queueInt) reconcileQueue();
   }
 }
 
@@ -269,6 +269,15 @@ function leaveToLobby() {
   renderCta();
 }
 
+// Hide the queue UI without canceling — keeps polling + localStorage so a
+// match still opens the duel and refresh/reconcile can restore status.
+function minimizeQueue() {
+  $("duel-box").hidden = true;
+  $("lobby").hidden = false;
+  toast("Still searching in the background", { detail: "Your queue is active on-chain. You'll jump into the duel when matched, or use the Arena to check status.", kind: "ok" });
+  renderCta();
+}
+
 // ───────────────── queue + matching ─────────────────
 async function scanForMyDuel(fromSeq, floor = 0) {
   const who = me();
@@ -290,11 +299,11 @@ function queueView(title, sub, withCancel = true) {
       </div>
       ${withCancel ? `<div class="actions" style="width:100%;max-width:340px">
         <button id="cancel-queue" class="btn btn-danger" type="button">Leave queue &amp; refund</button>
-        <button id="queue-back" class="btn btn-ghost" type="button">Back</button>
+        <button id="queue-back" class="btn btn-ghost" type="button">Hide (keep searching)</button>
       </div>` : ""}
     </div>`);
   $("cancel-queue")?.addEventListener("click", cancelQueue);
-  $("queue-back")?.addEventListener("click", leaveToLobby);
+  $("queue-back")?.addEventListener("click", minimizeQueue);
 }
 
 function startMatchPolling(startedAt) {
@@ -325,6 +334,8 @@ function startMatchPolling(startedAt) {
   queueInt = setInterval(check, 3000);
 }
 
+const isAlreadyQueuedErr = (err) => /already queued|unreachable/i.test(String(err?.message || "") + JSON.stringify(err));
+
 async function doJoin() {
   if (needWallet()) return;
   const casual = mode === "casual";
@@ -333,14 +344,38 @@ async function doJoin() {
   try {
     const res = await call("join_queue", { tier, casual }, utils.format.parseNearAmount(stake));
     localStorage.setItem("overclock_queued", JSON.stringify({ tier, casual }));
-    const startedAt = Date.now();
     queueView(
       "Looking for an opponent…",
       `${casual ? "Casual" : "Ranked"} · tier ${tier} · ${stake} NEAR · waiting <span id="q-elapsed" class="mono">0s</span>`
     );
     toast("You're in the queue", { detail: "We'll open the duel as soon as someone matches.", tx: txHash(res), kind: "ok" });
-    startMatchPolling(startedAt);
+    startMatchPolling(Date.now());
   } catch (err) {
+    if (isAlreadyQueuedErr(err)) {
+      // Most often: refresh/back left a stale queue. Recover gracefully.
+      let q = null;
+      try { q = JSON.parse(localStorage.getItem("overclock_queued") || "null"); } catch { /* ignore */ }
+      const same = q && q.tier === tier && !!q.casual === casual;
+      try {
+        const p = await viewC.get_player({ account: me() }).catch(() => null);
+        if (p?.queued && same) {
+          localStorage.setItem("overclock_queued", JSON.stringify({ tier, casual }));
+          queueView(
+            "Still in the queue",
+            `${casual ? "Casual" : "Ranked"} · tier ${tier} · ${stake} NEAR — resumed`
+          );
+          toast("Resumed your queue", { detail: "You were already queued — restored.", kind: "ok" });
+          startMatchPolling(Date.now());
+          return;
+        }
+      } catch { /* fall through */ }
+      leaveToLobby();
+      toast("Already queued", {
+        detail: "You're already in a queue on-chain (refresh/back can leave it active). Refresh the page to restore it, or use Leave queue on the restored view.",
+        kind: "bad",
+      });
+      return;
+    }
     leaveToLobby();
     toast("Couldn't join the queue", { detail: errMsg(err), kind: "bad" });
   }
@@ -351,7 +386,10 @@ async function cancelQueue() {
   let q = null;
   try { q = JSON.parse(localStorage.getItem("overclock_queued") || "null"); } catch { /* ignore */ }
   if (!q) {
-    toast("Not recorded as queued", { detail: "This browser has no queue record for you.", kind: "bad" });
+    toast("Queue record missing", { detail: "Restoring from chain…", kind: "bad" });
+    localStorage.removeItem("overclock_queued");
+    clearInterval(queueInt); clearInterval(queueTick);
+    reconcileQueue();
     return;
   }
   await busy($("cancel-queue"), async () => {
@@ -361,7 +399,15 @@ async function cancelQueue() {
       toast("Left the queue", { detail: "Your stake was refunded.", tx: txHash(res), kind: "ok" });
       leaveToLobby();
     } catch (err) {
-      toast("Couldn't leave the queue", { detail: errMsg(err), kind: "bad" });
+      const msg = errMsg(err);
+      if (/not queued/i.test(msg + String(err))) {
+        localStorage.removeItem("overclock_queued");
+        clearInterval(queueInt); clearInterval(queueTick);
+        leaveToLobby();
+        toast("Queue already cleared", { detail: "You're not in that queue on-chain anymore.", kind: "ok" });
+      } else {
+        toast("Couldn't leave the queue", { detail: msg, kind: "bad" });
+      }
     }
   });
 }
@@ -372,6 +418,77 @@ async function resumeDuel() {
     const id = await scanForMyDuel(Number(cfg.duel_seq));
     if (id) enterDuel(id);
   } catch { /* ignore */ }
+}
+
+// Restore queue state after refresh/back — fixes "stuck queued, can't rejoin".
+// The contract traps join_queue if already queued, so we must reconcile.
+async function reconcileQueue() {
+  if (!me() || !viewC || currentDuelId) return;
+  try {
+    const [p, cfg] = await Promise.all([
+      viewC.get_player({ account: me() }).catch(() => null),
+      viewC.get_config().catch(() => null),
+    ]);
+    // An in-flight duel takes priority over queue state.
+    if (cfg) {
+      const id = await scanForMyDuel(Number(cfg.duel_seq));
+      if (id) {
+        localStorage.removeItem("overclock_queued");
+        enterDuel(id);
+        return;
+      }
+    }
+    if (!p?.queued) {
+      localStorage.removeItem("overclock_queued");
+      return;
+    }
+    let q = null;
+    try { q = JSON.parse(localStorage.getItem("overclock_queued") || "null"); } catch { /* ignore */ }
+    if (q && Number.isFinite(q.tier)) {
+      queueView(
+        "Still in the queue",
+        `${q.casual ? "Casual" : "Ranked"} · tier ${q.tier} · ${TIER_STAKE[q.tier]} NEAR — restored after refresh`
+      );
+      toast("Queue restored", { detail: "You're still queued — scanning for a match.", kind: "ok" });
+      startMatchPolling(Date.now());
+      return;
+    }
+    // Queued on-chain but we don't know tier/mode (different browser/session).
+    // Show recovery so the user can cancel without guessing blindly.
+    enterDuelView(`
+      <div class="stage">
+        <div class="stage-head"><div class="stage-title">${pill("Queue active", "volt")} Stuck in queue</div></div>
+        <p class="muted">This account is queued on-chain (maybe from another tab or a refresh), but this browser doesn't know which tier. Pick the tier/mode you joined to leave and get your stake back.</p>
+        <div class="actions" style="flex-wrap:wrap;gap:8px;margin-top:12px">
+          ${[1,2,3].flatMap(t => [true,false].map(c =>
+            `<button class="btn stale-cancel" data-tier="${t}" data-casual="${c}" type="button">Cancel T${t} ${c ? "Casual" : "Ranked"}</button>`
+          )).join("")}
+        </div>
+        <div class="actions" style="margin-top:8px"><button id="stale-back" class="btn btn-ghost" type="button">Back</button></div>
+      </div>`);
+    document.querySelectorAll(".stale-cancel").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const t = Number(btn.dataset.tier);
+        const c = btn.dataset.casual === "true";
+        await busy(btn, async () => {
+          try {
+            const res = await call("cancel_queue", { tier: t, casual: c });
+            localStorage.removeItem("overclock_queued");
+            toast("Left the queue", { detail: `Canceled tier ${t} ${c ? "casual" : "ranked"}. Stake refunded.`, tx: txHash(res), kind: "ok" });
+            leaveToLobby();
+          } catch (err) {
+            const msg = errMsg(err);
+            if (/not queued/i.test(msg + String(err))) {
+              toast("Not that one", { detail: `You're not in tier ${t} ${c ? "casual" : "ranked"} — try another.`, kind: "bad" });
+            } else {
+              toast("Couldn't cancel", { detail: msg, kind: "bad" });
+            }
+          }
+        });
+      });
+    });
+    $("stale-back")?.addEventListener("click", leaveToLobby);
+  } catch { /* non-fatal */ }
 }
 
 // ───────────────── duel stage ─────────────────
