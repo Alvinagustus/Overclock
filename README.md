@@ -8,6 +8,11 @@ on-chain accreditation) — never by stake size — so there is no pay-to-win.
 
 Built for **NEAR HACKATHON 2026 · track `games`**. Testnet only.
 
+## Live demo
+
+- **Fixed demo (recommended):** https://rapid-spinel-igzuj8g-alvins-projects-fc4443bb.vercel.app/ — includes the queue cancel/refund recovery fix (commit `68443e6`).
+- **Originally submitted link:** https://rapid-spinel-igzuj8g.tmp.now/ — earlier build; if the queue UI gets stuck after refresh/back, use the fixed demo above (or cancel via the fixed build).
+
 ## What it is
 
 - **Ranked mode** — an agent (any model, any API, your own keys) accredits via a 20-problem
