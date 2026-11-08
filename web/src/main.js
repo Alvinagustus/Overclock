@@ -236,6 +236,8 @@ function renderCta() {
   if (!b) return;
   b.textContent = me() ? `Find ${mode} match · ${TIER_STAKE[tier]} NEAR` : "Connect wallet to play";
   renderModeNote();
+  const fix = $("fix-stuck-queue");
+  if (fix) fix.hidden = !(me() && (playerInfo?.queued || queueInt));
 }
 function bindSegmented(containerId, attr, onPick) {
   $(containerId).addEventListener("click", (e) => {
@@ -306,6 +308,44 @@ function queueView(title, sub, withCancel = true) {
   $("queue-back")?.addEventListener("click", minimizeQueue);
 }
 
+function showStaleQueueRecovery(message = "Pick the tier/mode you joined to leave and get your stake back.") {
+  enterDuelView(`
+    <div class="stage">
+      <div class="stage-head"><div class="stage-title">${pill("Queue active", "volt")} Cancel stuck queue</div></div>
+      <p class="muted">${esc(message)}</p>
+      <div class="actions" style="flex-wrap:wrap;gap:8px;margin-top:12px">
+        ${[1,2,3].flatMap(t => [true,false].map(c =>
+          `<button class="btn stale-cancel" data-tier="${t}" data-casual="${c}" type="button">Cancel T${t} ${c ? "Casual" : "Ranked"}</button>`
+        )).join("")}
+      </div>
+      <div class="actions" style="margin-top:8px"><button id="stale-back" class="btn btn-ghost" type="button">Back</button></div>
+    </div>`);
+  document.querySelectorAll(".stale-cancel").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const t = Number(btn.dataset.tier);
+      const c = btn.dataset.casual === "true";
+      await busy(btn, async () => {
+        try {
+          const res = await call("cancel_queue", { tier: t, casual: c });
+          localStorage.removeItem("overclock_queued");
+          clearInterval(queueInt); clearInterval(queueTick);
+          toast("Left the queue", { detail: `Canceled tier ${t} ${c ? "casual" : "ranked"}. Stake refunded.`, tx: txHash(res), kind: "ok" });
+          leaveToLobby();
+          loadProfile();
+        } catch (err) {
+          const msg = errMsg(err);
+          if (/not queued/i.test(msg + String(err))) {
+            toast("Not that one", { detail: `You're not in tier ${t} ${c ? "casual" : "ranked"} — try another.`, kind: "bad" });
+          } else {
+            toast("Couldn't cancel", { detail: msg, kind: "bad" });
+          }
+        }
+      });
+    });
+  });
+  $("stale-back")?.addEventListener("click", leaveToLobby);
+}
+
 function startMatchPolling(startedAt) {
   clearInterval(queueInt); clearInterval(queueTick);
   queueTick = setInterval(() => {
@@ -323,6 +363,7 @@ function startMatchPolling(startedAt) {
         if (found) {
           clearInterval(queueInt); clearInterval(queueTick);
           localStorage.removeItem("overclock_queued");
+          renderCta();
           toast("Match found", { detail: `Duel #${found} is live — commit your answer.`, kind: "ok" });
           enterDuel(found);
           loadBoard();
@@ -332,6 +373,7 @@ function startMatchPolling(startedAt) {
   };
   check();
   queueInt = setInterval(check, 3000);
+  renderCta();
 }
 
 const isAlreadyQueuedErr = (err) => /already queued|unreachable/i.test(String(err?.message || "") + JSON.stringify(err));
@@ -370,10 +412,9 @@ async function doJoin() {
         }
       } catch { /* fall through */ }
       leaveToLobby();
-      toast("Already queued", {
-        detail: "You're already in a queue on-chain (refresh/back can leave it active). Refresh the page to restore it, or use Leave queue on the restored view.",
-        kind: "bad",
-      });
+      showStaleQueueRecovery(
+        `You tried to join tier ${tier} ${casual ? "casual" : "ranked"}, but this account is already queued on-chain (a previous tab/refresh may have left it active). Pick the tier/mode to cancel and get your stake refunded, then try again.`
+      );
       return;
     }
     leaveToLobby();
@@ -381,6 +422,33 @@ async function doJoin() {
   }
 }
 $("join").addEventListener("click", doJoin);
+$("fix-stuck-queue")?.addEventListener("click", async () => {
+  if (needWallet()) return;
+  let q = null;
+  try { q = JSON.parse(localStorage.getItem("overclock_queued") || "null"); } catch { /* ignore */ }
+  if (q && Number.isFinite(q.tier)) {
+    // Try the known tier/mode first — one wallet prompt.
+    await busy($("fix-stuck-queue"), async () => {
+      try {
+        const res = await call("cancel_queue", { tier: q.tier, casual: !!q.casual });
+        localStorage.removeItem("overclock_queued");
+        clearInterval(queueInt); clearInterval(queueTick);
+        toast("Queue canceled & refunded", { detail: `Tier ${q.tier} ${q.casual ? "casual" : "ranked"}.`, tx: txHash(res), kind: "ok" });
+        leaveToLobby();
+        loadProfile();
+      } catch (err) {
+        if (/not queued/i.test(errMsg(err) + String(err))) {
+          localStorage.removeItem("overclock_queued");
+          showStaleQueueRecovery("The saved queue record didn't match on-chain. Pick the right tier/mode to cancel.");
+        } else {
+          toast("Couldn't cancel", { detail: errMsg(err), kind: "bad" });
+        }
+      }
+    });
+    return;
+  }
+  showStaleQueueRecovery();
+});
 
 async function cancelQueue() {
   let q = null;
@@ -454,40 +522,7 @@ async function reconcileQueue() {
       return;
     }
     // Queued on-chain but we don't know tier/mode (different browser/session).
-    // Show recovery so the user can cancel without guessing blindly.
-    enterDuelView(`
-      <div class="stage">
-        <div class="stage-head"><div class="stage-title">${pill("Queue active", "volt")} Stuck in queue</div></div>
-        <p class="muted">This account is queued on-chain (maybe from another tab or a refresh), but this browser doesn't know which tier. Pick the tier/mode you joined to leave and get your stake back.</p>
-        <div class="actions" style="flex-wrap:wrap;gap:8px;margin-top:12px">
-          ${[1,2,3].flatMap(t => [true,false].map(c =>
-            `<button class="btn stale-cancel" data-tier="${t}" data-casual="${c}" type="button">Cancel T${t} ${c ? "Casual" : "Ranked"}</button>`
-          )).join("")}
-        </div>
-        <div class="actions" style="margin-top:8px"><button id="stale-back" class="btn btn-ghost" type="button">Back</button></div>
-      </div>`);
-    document.querySelectorAll(".stale-cancel").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const t = Number(btn.dataset.tier);
-        const c = btn.dataset.casual === "true";
-        await busy(btn, async () => {
-          try {
-            const res = await call("cancel_queue", { tier: t, casual: c });
-            localStorage.removeItem("overclock_queued");
-            toast("Left the queue", { detail: `Canceled tier ${t} ${c ? "casual" : "ranked"}. Stake refunded.`, tx: txHash(res), kind: "ok" });
-            leaveToLobby();
-          } catch (err) {
-            const msg = errMsg(err);
-            if (/not queued/i.test(msg + String(err))) {
-              toast("Not that one", { detail: `You're not in tier ${t} ${c ? "casual" : "ranked"} — try another.`, kind: "bad" });
-            } else {
-              toast("Couldn't cancel", { detail: msg, kind: "bad" });
-            }
-          }
-        });
-      });
-    });
-    $("stale-back")?.addEventListener("click", leaveToLobby);
+    showStaleQueueRecovery("This account is queued on-chain (maybe from another tab or a refresh), but this browser doesn't know which tier. Pick the tier/mode you joined to leave and get your stake back.");
   } catch { /* non-fatal */ }
 }
 
