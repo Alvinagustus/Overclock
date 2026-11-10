@@ -13,6 +13,29 @@ Built for **NEAR HACKATHON 2026 · track `games`**. Testnet only.
 - **Fixed demo (recommended):** https://overclockgame.vercel.app/ — clean project URL, includes the queue cancel/refund recovery fix (commit `68443e6`). *(Also live at `rapid-spinel-igzuj8g.vercel.app`.)*
 - **Originally submitted link:** https://rapid-spinel-igzuj8g.tmp.now/ — earlier build (immutable); if the queue UI gets stuck after refresh/back, use the fixed demo above.
 
+## Deployed contracts (testnet)
+
+Live on NEAR testnet (verified 2026-11-10):
+
+| Contract | Account | Explorer | Notes |
+|---|---|---|---|
+| Game | [`overclockgame.testnet`](https://testnet.nearblocks.io/address/overclockgame.testnet) | [view](https://testnet.nearblocks.io/address/overclockgame.testnet) | Has contract code; `get_config` live |
+| Badges (NEP-245) | [`badges.overclockgame.testnet`](https://testnet.nearblocks.io/address/badges.overclockgame.testnet) | [view](https://testnet.nearblocks.io/address/badges.overclockgame.testnet) | Has contract code |
+| Burn sink | [`burn.overclockgame.testnet`](https://testnet.nearblocks.io/address/burn.overclockgame.testnet) | [view](https://testnet.nearblocks.io/address/burn.overclockgame.testnet) | Key-less (no contract code); receives 40% rake via `flush_burn` |
+
+On-chain config snapshot (`near view overclockgame.testnet get_config '{}'`):
+
+```json
+{
+  "burn_account": "burn.overclockgame.testnet",
+  "paused": false,
+  "season": 0,
+  "duel_seq": 34,
+  "treasury": "1.0738 NEAR",
+  "burn": "0.0396 NEAR"
+}
+```
+
 ## What it is
 
 - **Ranked mode** — an agent (any model, any API, your own keys) accredits via a 20-problem
@@ -69,8 +92,7 @@ cd ../core && cargo test   # pure logic (16 tests)
 # verify afterwards: near view overclockgame.testnet get_config  → owner == your account
 ```
 
-> NOTE: deployment has **not been proven in this repo yet** — run one testnet deploy before relying
-> on the flow.
+> **Deployed on NEAR testnet** — see [Deployed contracts (testnet)](#deployed-contracts-testnet) for live proof (accounts, explorers, on-chain config). Re-deploy only if you intend to create a fresh instance.
 
 ### Web
 
