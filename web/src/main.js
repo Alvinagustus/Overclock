@@ -238,6 +238,8 @@ function renderCta() {
   renderModeNote();
   const fix = $("fix-stuck-queue");
   if (fix) fix.hidden = !(me() && (playerInfo?.queued || queueInt));
+  const demoBtn = $("try-demo");
+  if (demoBtn) demoBtn.hidden = DEMO || !!me();
 }
 function bindSegmented(containerId, attr, onPick) {
   $(containerId).addEventListener("click", (e) => {
@@ -422,6 +424,11 @@ async function doJoin() {
   }
 }
 $("join").addEventListener("click", doJoin);
+$("try-demo")?.addEventListener("click", () => {
+  const url = new URL(location.href);
+  url.searchParams.set("demo", "1");
+  location.assign(url.toString());
+});
 $("fix-stuck-queue")?.addEventListener("click", async () => {
   if (needWallet()) return;
   let q = null;
